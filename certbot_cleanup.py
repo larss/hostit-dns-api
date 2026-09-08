@@ -3,13 +3,16 @@
 import os
 import sys
 
-from hostit_dns import HostItDNSClient
+from hostit_dns import HostItDNSClient, load_env_file
 
 
-def main() -> int:
-    domain = os.environ.get("CERTBOT_DOMAIN")
-    validation = os.environ.get("CERTBOT_VALIDATION")
-    dns_zone = os.environ.get("HOST_DNS_ZONE")
+load_env_file()
+
+
+def main():
+    domain = os.getenv("CERTBOT_DOMAIN")
+    validation = os.getenv("CERTBOT_VALIDATION")
+    dns_zone = os.getenv("HOST_DNS_ZONE")
 
     if not domain or not validation:
         print(
@@ -25,34 +28,14 @@ def main() -> int:
         )
         return 1
 
-    username = os.environ.get("HOST_USERNAME")
-    password = os.environ.get("HOST_PASSWORD")
-
-    if not username or not password:
-        print(
-            "ERROR: HOST_USERNAME and HOST_PASSWORD are required.",
-            file=sys.stderr,
-        )
-        return 1
-
-    client = HostItDNSClient(
-        username=username,
-        password=password,
-        sso_url=os.environ.get(
-            "HOST_SSO_URL",
-            "https://sso.test.host.it/cas/v1/tickets",
-        ),
-        api_base_url=os.environ.get(
-            "HOST_API_BASE_URL",
-            "https://api.host.it/public",
-        ),
-    )
+    print(f"Removing DNS-01 challenge for {domain}...")
+    print(f"DNS zone: {dns_zone}")
 
     record_name = f"_acme-challenge.{domain}."
 
-    print(f"Removing DNS-01 challenge for {domain}...")
-    print(f"DNS zone: {dns_zone}")
     print(f"Record:   {record_name}")
+
+    client = HostItDNSClient()
 
     client.delete_record(
         domain=dns_zone,
@@ -68,4 +51,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

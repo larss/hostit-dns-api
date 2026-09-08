@@ -6,20 +6,30 @@ import os
 import sys
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import requests
 
+__version__ = "0.0.2"
 
 DEFAULT_SSO_URL = "https://sso.host.it/cas/v1/tickets"
 DEFAULT_API_BASE_URL = "https://api.host.it/public"
 
-def load_env_file(path="/srv/dns_updater/.env"):
-    env_path = Path(path)
 
-    if not env_path.exists():
+def load_env_file(path=None):
+    """
+    Load environment variables from a .env file without overriding
+    variables already present in the environment.
+    """
+    if path is None:
+        path = Path(__file__).resolve().parent / ".env"
+    else:
+        path = Path(path)
+
+    if not path.exists():
         return
 
-    for line in env_path.read_text().splitlines():
+    for line in path.read_text().splitlines():
         line = line.strip()
 
         if not line or line.startswith("#") or "=" not in line:
@@ -29,8 +39,9 @@ def load_env_file(path="/srv/dns_updater/.env"):
         key = key.strip()
         value = value.strip()
 
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
+        if len(value) >= 2 and value[0] == value[-1]:
+            if value[0] in ("'", '"'):
+                value = value[1:-1]
 
         os.environ.setdefault(key, value)
 
@@ -42,14 +53,37 @@ class HostItAPIError(RuntimeError):
     """Raised when the Host.it API returns an unexpected response."""
 
 
+def load_configuration():
+    username = os.getenv("HOST_USERNAME")
+    password = os.getenv("HOST_PASSWORD")
+
+    if not username or not password:
+        raise HostItAPIError(
+            "Missing credentials.\n"
+            "Set HOST_USERNAME and HOST_PASSWORD in .env or the environment."
+        )
+
+    sso_url = os.getenv("HOST_SSO_URL", DEFAULT_SSO_URL)
+    api_base_url = os.getenv("HOST_API_BASE_URL", DEFAULT_API_BASE_URL)
+
+    return username, password, sso_url, api_base_url
+
+
 class HostItDNSClient:
     def __init__(
         self,
-        username: str,
-        password: str,
-        sso_url: str = DEFAULT_SSO_URL,
-        api_base_url: str = DEFAULT_API_BASE_URL,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        sso_url: Optional[str] = None,
+        api_base_url: Optional[str] = None,
     ):
+        if username is None or password is None or sso_url is None or api_base_url is None:
+            env_username, env_password, env_sso_url, env_api_base_url = load_configuration()
+            username = username if username is not None else env_username
+            password = password if password is not None else env_password
+            sso_url = sso_url if sso_url is not None else env_sso_url
+            api_base_url = api_base_url if api_base_url is not None else env_api_base_url
+
         self.username = username
         self.password = password
         self.sso_url = sso_url.rstrip("/")
@@ -144,12 +178,24 @@ class HostItDNSClient:
         record_type: str,
         content: str,
         ttl: int = 3600,
-    ) -> None:
-        """Create a DNS record."""
+    ) -> bool:
+        """
+        Create a DNS record.
+
+        Returns True if the record was created, False if an identical
+        record already exists (idempotent for Certbot re-runs).
+        """
+
+        normalized_name = self._normalize_record_name(name, domain)
+        record_type = record_type.upper()
+
+        zone = self.get_zone(domain)
+        if self.record_exists(zone, normalized_name, record_type, content):
+            return False
 
         payload = {
-            "name": self._normalize_record_name(name, domain),
-            "type": record_type.upper(),
+            "name": normalized_name,
+            "type": record_type,
             "content": content,
             "ttl": ttl,
         }
@@ -167,6 +213,8 @@ class HostItDNSClient:
                 f"{response.text}"
             )
 
+        return True
+
     def delete_record(
         self,
         domain: str,
@@ -175,7 +223,7 @@ class HostItDNSClient:
         content: str,
         ttl: int = 3600,
     ) -> None:
-        """Delete a DNS record."""
+        """Delete a specific DNS record value (does not remove other TXT values)."""
 
         payload = {
             "name": self._normalize_record_name(name, domain),
@@ -202,17 +250,16 @@ class HostItDNSClient:
         domain: str,
         value: str,
         ttl: int = 300,
-    ) -> None:
+    ) -> bool:
         """Create an ACME-style TXT record."""
 
-        self.create_record(
+        return self.create_record(
             domain=domain,
             name="_acme-challenge",
             record_type="TXT",
             content=f'"{value}"',
             ttl=ttl,
         )
-
 
     def delete_txt_record(
         self,
@@ -313,7 +360,7 @@ def command_create(client: HostItDNSClient, args) -> None:
     print(f"  Content: {args.content}")
     print(f"  TTL:     {args.ttl}")
 
-    client.create_record(
+    created = client.create_record(
         domain=args.domain,
         name=args.name,
         record_type=args.type,
@@ -321,7 +368,10 @@ def command_create(client: HostItDNSClient, args) -> None:
         ttl=args.ttl,
     )
 
-    print("Record created successfully.")
+    if created:
+        print("Record created successfully.")
+    else:
+        print("Record already exists; skipping.")
 
 
 def command_delete(client: HostItDNSClient, args) -> None:
@@ -340,6 +390,19 @@ def command_delete(client: HostItDNSClient, args) -> None:
     )
 
     print("Record deleted successfully.")
+
+
+def command_exists(client: HostItDNSClient, args) -> int:
+    name = client._normalize_record_name(args.name, args.domain)
+    zone = client.get_zone(args.domain)
+    found = client.record_exists(zone, name, args.type, args.content)
+
+    if found:
+        print(f"Record exists: {name} {args.type.upper()} {args.content}")
+        return 0
+
+    print(f"Record not found: {name} {args.type.upper()} {args.content}")
+    return 1
 
 
 def command_test(client: HostItDNSClient, args) -> None:
@@ -365,30 +428,18 @@ def command_test(client: HostItDNSClient, args) -> None:
     print("=" * 60)
 
     try:
-        # --------------------------------------------------------------
-        # Authentication
-        # --------------------------------------------------------------
-
         print("\n[1/6] Authenticating...")
         client.authenticate()
         print("      OK")
 
-        # --------------------------------------------------------------
-        # Initial GET
-        # --------------------------------------------------------------
-
         print("\n[2/6] Reading DNS zone...")
-        initial_zone = client.get_zone(domain)
+        client.get_zone(domain)
         print("      OK")
-
-        # --------------------------------------------------------------
-        # POST
-        # --------------------------------------------------------------
 
         print("\n[3/6] Creating temporary TXT record...")
         print(f"      {test_fqdn}")
 
-        client.create_record(
+        created_now = client.create_record(
             domain=domain,
             name=test_name,
             record_type="TXT",
@@ -397,11 +448,7 @@ def command_test(client: HostItDNSClient, args) -> None:
         )
 
         created = True
-        print("      OK")
-
-        # --------------------------------------------------------------
-        # GET verification
-        # --------------------------------------------------------------
+        print("      OK" if created_now else "      OK (already present)")
 
         print("\n[4/6] Verifying record...")
         verification_zone = client.get_zone(domain)
@@ -419,10 +466,6 @@ def command_test(client: HostItDNSClient, args) -> None:
         print("      OK")
 
     finally:
-        # --------------------------------------------------------------
-        # DELETE
-        # --------------------------------------------------------------
-
         if created:
             print("\n[5/6] Deleting temporary TXT record...")
 
@@ -438,10 +481,6 @@ def command_test(client: HostItDNSClient, args) -> None:
 
             except Exception as exc:
                 print(f"      WARNING: deletion failed: {exc}", file=sys.stderr)
-
-    # --------------------------------------------------------------
-    # Final GET
-    # --------------------------------------------------------------
 
     print("\n[6/6] Verifying deletion...")
 
@@ -490,7 +529,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
-    # GET
     get_parser = subparsers.add_parser(
         "get",
         help="Retrieve a DNS zone",
@@ -500,7 +538,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Domain name, e.g. example.com",
     )
 
-    # CREATE
     create_parser = subparsers.add_parser(
         "create",
         help="Create a DNS record",
@@ -528,7 +565,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="TTL in seconds (default: 3600)",
     )
 
-    # DELETE
     delete_parser = subparsers.add_parser(
         "delete",
         help="Delete a DNS record",
@@ -552,7 +588,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=3600,
     )
 
-    # TEST
+    exists_parser = subparsers.add_parser(
+        "exists",
+        help="Check whether a specific DNS record exists",
+    )
+    exists_parser.add_argument("domain")
+    exists_parser.add_argument(
+        "--name",
+        required=True,
+        help="Record name, e.g. _acme-challenge.example.com.",
+    )
+    exists_parser.add_argument(
+        "--type",
+        required=True,
+        help="DNS record type, e.g. TXT",
+    )
+    exists_parser.add_argument(
+        "--content",
+        required=True,
+        help='Record content, e.g. \'"some-token"\'',
+    )
+
     test_parser = subparsers.add_parser(
         "test",
         help="Run a complete DNS API CRUD test",
@@ -565,33 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_configuration():
-    username = os.getenv("HOST_USERNAME")
-    password = os.getenv("HOST_PASSWORD")
-
-    if not username or not password:
-        raise HostItAPIError(
-            "Missing credentials.\n"
-            "Set HOST_USERNAME and HOST_PASSWORD in .env or the environment."
-        )
-
-    sso_url = os.getenv("HOST_SSO_URL", DEFAULT_SSO_URL)
-    api_base_url = os.getenv("HOST_API_BASE_URL", DEFAULT_API_BASE_URL)
-
-    return username, password, sso_url, api_base_url
-
 def main() -> int:
     try:
         args = build_parser().parse_args()
-
-        username, password, sso_url, api_base_url = load_configuration()
-
-        client = HostItDNSClient(
-            username=username,
-            password=password,
-            sso_url=sso_url,
-            api_base_url=api_base_url,
-        )
+        client = HostItDNSClient()
 
         if args.command == "get":
             command_get(client, args)
@@ -601,6 +634,9 @@ def main() -> int:
 
         elif args.command == "delete":
             command_delete(client, args)
+
+        elif args.command == "exists":
+            return command_exists(client, args)
 
         elif args.command == "test":
             command_test(client, args)

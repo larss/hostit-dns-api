@@ -1,20 +1,10 @@
-# Credentials
 .env
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
 .venv/
 venv/
-env/
+__pycache__/
+*.py[cod]
 
-# IDEs
-.vscode/
 .idea/
+.vscode/
 
-# OS files
 .DS_Store
-Thumbs.db

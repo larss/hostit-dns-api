@@ -1,0 +1,7 @@
+FROM certbot/certbot
+
+RUN pip install --no-cache-dir "requests>=2.31,<3"
+
+COPY hostit_dns.py /opt/hostit-dns-api/
+COPY certbot_authenticator.py /opt/hostit-dns-api/
+COPY certbot_cleanup.py /opt/hostit-dns-api/
